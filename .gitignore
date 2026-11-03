@@ -1,0 +1,4 @@
+pdi_where
+*.log
+*.jou
+.Xil/

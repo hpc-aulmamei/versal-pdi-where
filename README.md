@@ -1,0 +1,149 @@
+# versal-pdi-where
+
+`pdi_where` reads a Versal SSIT partial PDI and the pblock XDC of the shell, and says which
+reconfigurable pblock the PDI configures. In the [SLASH](https://github.com/Xilinx/SLASH) service
+shell, that tells a service-layer partial (`pblock_service_layer`) from a user-region partial
+(`pblock_slash`). It needs no Vivado at run time and reads both compressed and uncompressed PDIs.
+When a pblock changes, pass the new XDC: the footprint is recomputed from it on every run.
+
+```
+make                                    # needs g++ (C++17) and zlib
+./pdi_where --xdc impl.xdc  top_i_service_layer_..._partial.pdi  app.vbin
+./pdi_where --xdc a.xdc --xdc b.xdc ... # candidates from several shells or floorplans at once
+./pdi_where ... --json                  # machine-readable
+./pdi_where ... --rp pblock_slash       # name the candidate pblocks instead of guessing them
+./pdi_where --selftest                  # synthetic device, XDC and PDIs (also: make check)
+BUILDS=... tests/test_real.sh           # real partials of known pblock, from a manifest
+```
+
+Example, on a SLASH service-shell build:
+
+```
+$ ./pdi_where --xdc tests/fixtures/slash-service.xdc top_i_service_layer_service_layer_inst_0_partial.pdi
+warning: tests/fixtures/slash-service.xdc: pblock_service_layer: site type ILKNF is not in the device table; ignored
+top_i_service_layer_service_layer_inst_0_partial.pdi
+  13738624 bytes, id_code 0x14d2f093, image 0x18700002 "CONFIG_MASTER", compressed (rows from FAR-header scan)
+  SLR0  configured CFU      4694576 B  NPI writes   70  CFU rows {0,2,3} by FAR hits 0:7954 1:14 2:59078 3:64231
+  SLR1  configured CFU      8745552 B  NPI writes   92  CFU rows {0,1,2} by FAR hits 0:57416 1:65688 2:49731
+  SLR2  empty      CFU          896 B  NPI writes    0
+  fail pblock_slash (tests/fixtures/slash-service.xdc): covers SLR1+SLR2, area-share distance 1.79
+       writes SLR0, which the pblock does not cover
+       writes SLR0 CFU rows {0,2,3} outside the pblock's {}
+       writes SLR1 CFU rows {0,1} outside the pblock's {2}
+       pblock has fabric in SLR2, which the PDI does not configure
+  loose pblock_service_layer (tests/fixtures/slash-service.xdc): covers SLR0+SLR1, area-share distance 0.03
+       writes SLR0 CFU rows {0} outside the pblock's {2,3}
+  => pblock_service_layer
+  file name says pblock_service_layer (agrees)
+```
+
+## Inputs
+
+- **Partials:** a `.pdi`, or a `.vbin` (gzip'd tar), from which every `*_partial.pdi` member is
+  read. Only the one-image, one-partition partials Vivado writes are handled, not full PDIs.
+- **One or more XDCs.** Candidates are the pblocks with `SNAPPING_MODE` set, which Vivado applies
+  only to reconfigurable pblocks; static pblocks such as a DFX decoupler's are left out. `--rp`
+  names the candidates explicitly instead.
+  - Commands read: `create_pblock`, `resize_pblock … -add/-remove {ranges}`,
+    `add_cells_to_pblock` and `set_property … [get_pblocks …]`.
+  - Syntax handled: `[get_pblocks -quiet X]`, bare names, braces and backslash continuations.
+  - `-remove` ranges are ignored, with a warning.
+- **The device table** `device/xcv80.tsv`, written once per part by
+  `scripts/gen_device_table.tcl`. That script opens the part only, with no design and no build:
+
+  ```
+  vivado -mode batch -source scripts/gen_device_table.tcl -tclargs xcv80-lsva4737-2MHP-e-S device/xcv80.tsv
+  ```
+
+  For each site type, the table gives the X/Y range and the SLR within every clock region. Sites
+  that lie in no clock region get one line per type and SLR. The tool looks for the table at
+  `--device`, then `$PDI_WHERE_DEVICE`, then `device/xcv80.tsv` next to the executable.
+
+  **The shipped `device/xcv80.tsv` is incomplete.** It is a snapshot of an interrupted run and
+  lacks:
+  - clock regions X9Y4 (in part) to X9Y9;
+  - every site that lies in no clock region, such as `ILKNF`, which is why the example above
+    warns about it.
+
+  Every result in this README was obtained with this snapshot. A complete table will replace it;
+  until then, regenerate it with the command above if you have Vivado.
+
+Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable` or `none`, 2 on error.
+
+## How it decides
+
+The master SLR's CDO stream configures SLR0. Keyhole writes (module 1, command 0x0D) to
+0x10A100000 and 0x112100000 forward the sub-streams of SLR1 and SLR2, each a sequence of CDO
+sections. A keyhole write to 0xF1F80000 is CFU (configuration-frame) data for the SLR whose stream
+carries it.
+
+1. **SLRs (hard).** A partial writes frames in every SLR where its pblock has fabric, and in no
+   other. An SLR it does not touch still receives its fixed CFU chunks: exactly 896 B compressed
+   (7 × 128 B) or 1,456 B uncompressed, and no NPI writes. This held for all 40 such SLRs in 77
+   real partials; the smallest configured SLR in those partials carries 1.45 MB. An SLR therefore
+   counts as configured above 64 KiB of CFU data, or with any NPI write. On the pblock side, an
+   SLR where the pblock has only clock or hard-block sites, and no SLICEs, need not be
+   configured; the tool prints a note when it isn't.
+2. **Clock-region rows (hard one way, soft the other).** Each frame names its CFU row: the index
+   of the clock-region row among the SLR's fabric rows (rows that contain SLICEs). On the xcv80,
+   SLR0 has rows 1–4 (row 0 has no fabric), SLR1 rows 5–7 and SLR2 rows 8–10. The tool reads the
+   rows written as follows:
+   - **Uncompressed stream:** decoded frame by frame.
+   - **Compressed stream:** not decoded. The FAR packet header (`0xA1 | row | 0x01 | check`)
+     survives compression, but not aligned to 16-byte quads. The tool counts that 4-byte pattern
+     at every byte offset, per row byte. A row counts as written at ≥ max(500, 2 % of the SLR's
+     busiest row) hits, and only if the SLR has that row. In 74 real compressed partials, the 522
+     written rows got 7,954–70,579 hits (at least 12 % of the SLR's busiest row), and the 50
+     in-range rows that weren't written got at most 70. The row values 82, 161 and 253 (0x52,
+     0xA1, 0xFD) recur as structural artefacts with up to 60,307 hits. They are dropped only
+     because no SLR has that many rows, so the device table's row count is load-bearing here.
+
+   Every row where the pblock has SLICEs must be written: this rejects a candidate. A row written
+   outside the pblock only counts against the candidate, for two reasons. A full-device SLASH
+   compute partial writes SLR0 CFU row 0, which no site of its pblock reaches. The service layer's
+   partial writes part of SLR0 row 0 through GT-side hard blocks that belong to no clock region.
+3. **Tie-break.** The fewest rows written outside the pblock wins, then the per-SLR share of CFU
+   bytes compared with the pblock's per-SLR share of SLICEs.
+
+Status:
+- **match:** exactly one pblock passes the hard tests, or several do and exactly one has no row
+  outside it.
+- **ambiguous:** several pass with no row outside them; the nearest by area share is named.
+- **probable:** several pass, but all with rows outside them; the closest is named.
+- **none:** nothing passes.
+
+The `.vbin` member name (`top_i_<cell>_…_partial.pdi`, compared with `add_cells_to_pblock`) is
+printed as a cross-check and is never used to decide.
+
+## What it was checked on
+
+72 real partials from Vivado 2025.1 builds for the V80 (xcv80), all placed in the right pblock:
+
+- **SLASH service shell:** 5 service-layer and 5 user-region partials, each a `match`. Both
+  shells' XDCs were given together.
+- **SLASH compute shell:** 15 partials, each a `match`.
+- **Five other floorplans of the compute shell,** all named `pblock_slash` and told apart only by
+  their XDCs: 42 partials, 3 of them uncompressed.
+  - 34 are a `match`. These include the three floorplans that share SLR1 + SLR2 and differ only
+    in which SLR1 rows they cover.
+  - 8 are `probable`, with the right pblock named. All come from the full-device floorplan,
+    where a second floorplan, the first one's SLR0 top row plus SLR1 and SLR2, also passes.
+
+`tests/slash.manifest` re-runs the SLASH part against the bundled XDC fixtures.
+
+## Limits
+
+- **Format:** the PDI format knowledge is inferred from Vivado 2025.1 xcv80 partials, not taken
+  from AMD documentation. Another Vivado version or part may differ; the selftest pins the
+  format the tool assumes. Other parts need their own device table, and the tool expects three
+  SLRs.
+- **Unchecked:** the CFU-row mapping was checked on SLR1 rows 5–7, SLR2 rows 8–10 and SLR0 row 4.
+  SLR0 rows 1–3 were never isolated in a floorplan of their own.
+- **Footprint estimate:** from XDC bounding boxes intersected with the device table. A site type
+  missing from the table is warned about and ignored.
+- **NPI writes:** counted, but not mapped to NoC sites; Vivado exposes no NPI address on a site.
+
+## License
+
+MIT, © 2026 ARH Laboratory; see `LICENSE`. The XDCs in `tests/fixtures/` are copied unchanged
+from SLASH (© Advanced Micro Devices, Inc., MIT) and keep their own notice.

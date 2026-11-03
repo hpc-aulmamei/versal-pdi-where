@@ -1,0 +1,10 @@
+# SLASH shells (github.com/Xilinx/SLASH, linker/slashkit/resources/base/*/constraints/impl.xdc).
+# Both XDCs are given every time, so each partial is placed among three candidate pblocks:
+# service shell: pblock_service_layer (SLR0 + SLR1) and pblock_slash (SLR1 top + SLR2);
+# compute shell: pblock_slash (SLR0 + SLR1 + SLR2).
+#
+# BUILDS points at a directory of SLASH builds (Vivado runs or packaged .vbin files).
+
+slash-service.xdc:pblock_service_layer  fixtures/slash-service.xdc,fixtures/slash-compute.xdc  $BUILDS/*service*/slash.runs/impl_1/top_i_service_layer_*_partial.pdi $BUILDS/*/*.service/slash.runs/impl_1/top_i_service_layer_*_partial.pdi
+slash-service.xdc:pblock_slash          fixtures/slash-service.xdc,fixtures/slash-compute.xdc  $BUILDS/*service*/slash.runs/impl_1/top_i_slash_*_partial.pdi $BUILDS/*/*.service/slash.runs/impl_1/top_i_slash_*_partial.pdi
+slash-compute.xdc:pblock_slash          fixtures/slash-service.xdc,fixtures/slash-compute.xdc  $BUILDS/*compute*/slash.runs/impl_1/top_i_slash_*_partial.pdi $BUILDS/*/*.compute/slash.runs/impl_1/top_i_slash_*_partial.pdi $BUILDS/*compute*/*.vbin
