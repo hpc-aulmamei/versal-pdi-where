@@ -162,6 +162,12 @@ void visit(const std::vector<uint8_t>& b, uint64_t s, uint64_t e, int slr, PdiIn
                         return;
                     }
             }
+            // A keyhole write that is neither CFU nor an SLR-forward routed from the master. Real
+            // partials never do this; it is recorded so a placement resting on this SLR can abstain,
+            // since such a write could carry frames the row and SLR accounting does not see.
+            ++u.stray_keyholes;
+            u.stray_keyhole_dsts.insert(dst);
+            return;
         }
         if (c.module == 1 && c.id == 0x05 && c.words >= 2) {
             ++u.npi_writes;
@@ -173,6 +179,18 @@ void visit(const std::vector<uint8_t>& b, uint64_t s, uint64_t e, int slr, PdiIn
 }  // namespace
 
 bool SlrUse::configured() const { return cfu_bytes > kEmptyCfuMax || npi_writes > 0; }
+
+// An SLR that is not configured is still unambiguously empty when its CFU content is a clean
+// open/close with no frames. That shows two ways: the chunk decodes with zero frames (the
+// uncompressed empty), or it is one of the two fixed empty footprints seen in every real untouched
+// SLR, 896 B compressed (7 x 128 B) and 1,456 B uncompressed, which do not decode as frames.
+// Anything else below the configured ceiling, undecodable bytes or a handful of frames, sits in a
+// grey zone the SLR/row accounting cannot resolve.
+bool SlrUse::ambiguous_cfu() const {
+    if (configured() || cfu_bytes == 0) return false;
+    if (decoded && frames == 0) return false;
+    return cfu_bytes != 896 && cfu_bytes != 1456;
+}
 
 bool PdiInfo::compressed() const {
     for (const auto& u : slr)

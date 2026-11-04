@@ -37,7 +37,14 @@ struct SlrUse {
     // compression intact but not quad-aligned; hits of that 4-byte pattern at any byte offset, per
     // row byte. Real rows get thousands of hits; see rows_written() in main.cpp for the filter.
     std::map<int, uint64_t> far_hits;
-    bool configured() const;     // see kEmptyCfuMax in pdi.cpp
+    int stray_keyholes = 0;        // keyhole writes to neither CFU nor an SLR-forward (never in real
+                                   // partials); a frame-capable write the accounting does not follow
+    std::set<uint64_t> stray_keyhole_dsts;
+    bool configured() const;       // see kEmptyCfuMax in pdi.cpp
+    // CFU content that is neither clearly empty nor clearly a configured SLR: 0 < bytes <= the empty
+    // ceiling, or an undecodable chunk small enough that the SLR still reads as empty. Placement
+    // cannot tell whether such an SLR is configured, so a verifier abstains on it.
+    bool ambiguous_cfu() const;
 };
 
 struct PdiInfo {

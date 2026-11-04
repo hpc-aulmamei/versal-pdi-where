@@ -178,10 +178,35 @@ std::string json_str(const std::string& s) {
 
 struct Result {
     const Candidate* chosen = nullptr;
-    std::string status;  // "match", "probable", "ambiguous", "none"
+    std::string status;  // "match", "probable", "ambiguous", "unverified", "none"
     std::vector<Verdict> verdicts;
     std::string hint;
+    std::vector<std::string> caveats;  // content that makes the placement untrustworthy
 };
+
+// Content in the PDI that bears on whether any placement can be trusted, independent of which pblock
+// fits best: a keyhole write off the CFU and SLR-forward paths, or CFU content that is neither empty
+// nor a configured SLR. Neither occurs in real Vivado partials.
+std::vector<std::string> trust_caveats(const PdiInfo& p) {
+    std::vector<std::string> out;
+    for (int k = 0; k < kSlrs; ++k) {
+        const SlrUse& u = p.slr[k];
+        if (u.stray_keyholes > 0) {
+            std::string d;
+            for (uint64_t a : u.stray_keyhole_dsts) {
+                char buf[20];
+                std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(a));
+                d += (d.empty() ? "" : ",") + std::string(buf);
+            }
+            out.push_back(std::string(kSlrName[k]) + ": " + std::to_string(u.stray_keyholes) +
+                          " keyhole write(s) to " + d + ", off the CFU and SLR-forward paths");
+        }
+        if (u.ambiguous_cfu())
+            out.push_back(std::string(kSlrName[k]) + ": " + std::to_string(u.cfu_bytes) +
+                          " B of CFU content, neither an empty SLR nor a configured one");
+    }
+    return out;
+}
 
 Result classify(const PdiInfo& p, const std::vector<Candidate>& cs) {
     Result r;
@@ -210,6 +235,10 @@ Result classify(const PdiInfo& p, const std::vector<Candidate>& cs) {
         r.status = "probable";
         r.chosen = hard[0]->c;
     }
+    // A named placement cannot be trusted while the PDI carries frame-capable content the SLR and
+    // row accounting does not follow. Keep the best-fit pblock as a guess, but mark it unverified.
+    r.caveats = trust_caveats(p);
+    if (!r.caveats.empty() && r.chosen) r.status = "unverified";
     return r;
 }
 
@@ -222,6 +251,8 @@ std::string verdict(const Result& r) {
 
 void print_short(const PdiInfo& p, const Result& r) {
     std::printf("%s: %s\n", p.name.c_str(), verdict(r).c_str());
+    for (const auto& c : r.caveats)
+        std::fprintf(stderr, "pdi_where: unverified: %s: %s\n", p.name.c_str(), c.c_str());
     if (!r.hint.empty() && (!r.chosen || r.chosen->pb->name != r.hint))
         std::fprintf(stderr, "pdi_where: warning: %s: member name points to %s\n", p.name.c_str(), r.hint.c_str());
 }
@@ -267,6 +298,10 @@ void print_long(const PdiInfo& p, const Result& r) {
                     basename(v.c->pb->source).c_str(), slrs.empty() ? "-" : slrs.c_str(), v.share_dist, state.c_str());
         for (const auto& w : v.why) std::printf("    %s\n", w.c_str());
     }
+    if (!r.caveats.empty()) {
+        std::printf("\n  unverified:\n");
+        for (const auto& c : r.caveats) std::printf("    %s\n", c.c_str());
+    }
     if (!r.hint.empty())
         std::printf("\n  member name points to %s%s\n", r.hint.c_str(),
                     r.chosen && r.chosen->pb->name == r.hint ? "" : " (differs)");
@@ -304,6 +339,8 @@ void print_json(const PdiInfo& p, const Result& r, bool last) {
         for (size_t j = 0; j < v.why.size(); ++j) std::printf("%s%s", j ? ", " : "", json_str(v.why[j]).c_str());
         std::printf("]}");
     }
+    std::printf("],\n   \"caveats\": [");
+    for (size_t j = 0; j < r.caveats.size(); ++j) std::printf("%s%s", j ? ", " : "", json_str(r.caveats[j]).c_str());
     std::printf("],\n   \"status\": \"%s\", \"pblock\": %s, \"name_hint\": %s}%s\n", r.status.c_str(),
                 r.chosen ? json_str(r.chosen->pb->name).c_str() : "null",
                 r.hint.empty() ? "null" : json_str(r.hint).c_str(), last ? "" : ",");
@@ -596,6 +633,21 @@ int selftest() {
         Result r = classify(p, cs);
         check("mixed: placement uses the decoded rows -> pblock_wide",
               r.status == "match" && r.chosen->pb->name == "pblock_wide");
+    }
+    // 3f. verifier: content off the accounted paths makes a placement unverified rather than a match.
+    {
+        SlrUse e0;             check("verify: empty CFU is not ambiguous", !e0.ambiguous_cfu());
+        SlrUse g;  g.cfu_bytes = 5000;     check("verify: grey-zone CFU is ambiguous", g.ambiguous_cfu());
+        SlrUse f;  f.cfu_bytes = 2000000;  check("verify: configured CFU is not ambiguous", !f.ambiguous_cfu());
+        SlrUse em; em.cfu_bytes = 896;     check("verify: known empty size is not ambiguous", !em.ambiguous_cfu());
+
+        PdiInfo p = analyse("wide2.pdi", synth_pdi({}, rows01(), rows01(), {0, 1, 1}));
+        check("verify: clean partial is a plain match", classify(p, cs).status == "match");
+        p.slr[1].stray_keyholes = 1;
+        p.slr[1].stray_keyhole_dsts.insert(0xF1F80010ULL);
+        Result r = classify(p, cs);
+        check("verify: keyhole off the accounted paths -> unverified, best guess kept",
+              r.status == "unverified" && r.chosen && r.chosen->pb->name == "pblock_wide" && !r.caveats.empty());
     }
     // 4. a partial that configures only SLR2: matches nothing (every candidate has fabric elsewhere)
     {

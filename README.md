@@ -92,7 +92,8 @@ top_i_service_layer_service_layer_inst_0_partial.pdi: pblock_service_layer
   (`device/xcv80.tsv`, as in the build tree), then in `share/versal-pdi-where/` of the install
   tree.
 
-Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable` or `none`, 2 on error.
+Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable`, `unverified` or
+`none`, 2 on error.
 
 ## How it decides
 
@@ -134,7 +135,21 @@ Status:
   outside it.
 - **ambiguous:** several pass with no row outside them; the nearest by area share is named.
 - **probable:** several pass, but all with rows outside them; the closest is named.
+- **unverified:** a pblock was chosen, but the PDI carries frame-capable content the SLR and row
+  accounting does not follow, so the placement cannot be trusted. The best-fit pblock is still
+  named, as a guess; the reasons are printed under `unverified:` (to stderr in the default output,
+  in the `caveats` array in JSON). Two things trigger it, neither seen in any real Vivado partial:
+  a keyhole write to a destination other than the CFU stream or an SLR forward, and CFU content in
+  an SLR that is neither a clean empty chunk nor a configured SLR (0 < it < the configured
+  threshold).
 - **none:** nothing passes.
+
+What the verdict rests on, and what it does not: the tool follows the keyhole-CFU configuration
+path (frames to `0xF1F80000` and the SLR-forward sub-streams) and counts NPI writes. It does not
+interpret the other CDO commands a partial contains (direct register and mask writes), so it cannot
+prove a partial configures *only* what its pblock covers through some other path; `unverified`
+flags the cases it can detect. A placement is therefore a strong statement about the frame path,
+not a security boundary on its own.
 
 The `.vbin` member name (`top_i_<cell>_…_partial.pdi`, compared with `add_cells_to_pblock`) is
 printed as a cross-check and is never used to decide.
