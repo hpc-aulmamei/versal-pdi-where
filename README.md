@@ -6,35 +6,66 @@ shell, that tells a service-layer partial (`pblock_service_layer`) from a user-r
 (`pblock_slash`). It needs no Vivado at run time and reads both compressed and uncompressed PDIs.
 When a pblock changes, pass the new XDC: the footprint is recomputed from it on every run.
 
-```
-make                                    # needs g++ (C++17) and zlib
-./pdi_where --xdc impl.xdc  top_i_service_layer_..._partial.pdi  app.vbin
-./pdi_where --xdc a.xdc --xdc b.xdc ... # candidates from several shells or floorplans at once
-./pdi_where ... --json                  # machine-readable
-./pdi_where ... --rp pblock_slash       # name the candidate pblocks instead of guessing them
-./pdi_where --selftest                  # synthetic device, XDC and PDIs (also: make check)
-BUILDS=... tests/test_real.sh           # real partials of known pblock, from a manifest
-```
+## Build
 
-Example, on a SLASH service-shell build:
+Needs CMake 3.21 or later, a C++17 compiler and zlib.
 
 ```
-$ ./pdi_where --xdc tests/fixtures/slash-service.xdc top_i_service_layer_service_layer_inst_0_partial.pdi
-top_i_service_layer_service_layer_inst_0_partial.pdi
-  13738624 bytes, id_code 0x14d2f093, image 0x18700002 "CONFIG_MASTER", compressed (rows from FAR-header scan)
-  SLR0  configured CFU      4694576 B  NPI writes   70  CFU rows {0,2,3} by FAR hits 0:7954 1:14 2:59078 3:64231
-  SLR1  configured CFU      8745552 B  NPI writes   92  CFU rows {0,1,2} by FAR hits 0:57416 1:65688 2:49731
-  SLR2  empty      CFU          896 B  NPI writes    0
-  fail pblock_slash (tests/fixtures/slash-service.xdc): covers SLR1+SLR2, area-share distance 1.79
-       writes SLR0, which the pblock does not cover
-       writes SLR0 CFU rows {0,2,3} outside the pblock's {}
-       writes SLR1 CFU rows {0,1} outside the pblock's {2}
-       pblock has fabric in SLR2, which the PDI does not configure
-  loose pblock_service_layer (tests/fixtures/slash-service.xdc): covers SLR0+SLR1, area-share distance 0.01
-       writes SLR0 CFU rows {0} outside the pblock's {2,3}
-  => pblock_service_layer
-  file name says pblock_service_layer (agrees)
+cmake --preset default && cmake --build --preset default    # build/pdi_where
+ctest --preset default                                      # selftest and CLI checks
+cmake --install build --prefix ~/.local                     # bin/, share/versal-pdi-where/
 ```
+
+The presets are `default` (RelWithDebInfo, in `build/`), `release`, and `debug` (ASan, UBSan and
+`-Werror`, in `build/debug/`). The plain `cmake -S . -B build` route works too. Options:
+
+| Option | Default | |
+|---|---|---|
+| `PDI_WHERE_LTO` | ON | link-time optimisation in Release and RelWithDebInfo |
+| `PDI_WHERE_SANITIZE` | OFF | AddressSanitizer and UndefinedBehaviorSanitizer |
+| `PDI_WHERE_WERROR` | OFF | warnings are errors |
+| `PDI_WHERE_BUILDS` | `$BUILDS` | directory of SLASH builds; adds the `real` test, which runs `tests/test_real.sh` |
+
+`--version` prints the project version and the `git describe` of the tree it was built from.
+`cpack` in the build directory makes a `.tar.gz` of the install tree.
+
+## Usage
+
+```
+pdi_where --xdc impl.xdc  top_i_service_layer_..._partial.pdi  app.vbin
+pdi_where --xdc a.xdc --xdc b.xdc ...    # candidates from several shells or floorplans at once
+pdi_where -v ...                         # SLRs, rows and every candidate
+pdi_where --json ...                     # machine-readable
+pdi_where --rp pblock_slash ...          # name the candidate pblocks instead of guessing them
+pdi_where --selftest                     # synthetic device, XDC and PDIs, TAP output
+```
+
+One line per partial, `file: pblock`, with `(probable)` or `(ambiguous)` after the name when the
+result is weaker than a match, or `no match`. With `-v`, on a SLASH service-shell build:
+
+```
+$ pdi_where -v --xdc tests/fixtures/slash-service.xdc top_i_service_layer_service_layer_inst_0_partial.pdi
+top_i_service_layer_service_layer_inst_0_partial.pdi: pblock_service_layer
+  13738624 bytes, idcode 0x14d2f093, image 0x18700002 (CONFIG_MASTER), compressed
+
+  SLR   CFU bytes   NPI  rows
+  0       4694576    70  0,2,3    far hits 0:7954 1:14 2:59078 3:64231
+  1       8745552    92  0,1,2    far hits 0:57416 1:65688 2:49731
+  2           896     0  -        not configured
+
+  pblock                xdc                SLRs   dist
+  pblock_slash          slash-service.xdc  1,2    1.79  rejected
+    SLR0 written, not in pblock
+    SLR0 rows 0,2,3 written outside pblock
+    SLR1 rows 0,1 written outside pblock (pblock has 2)
+    SLR2 in pblock, not written
+  pblock_service_layer  slash-service.xdc  0,1    0.01  fits, 1 row outside
+    SLR0 row 0 written outside pblock (pblock has 2,3)
+
+  member name points to pblock_service_layer
+```
+
+`dist` is the area-share distance used to break ties (see below).
 
 ## Inputs
 
@@ -57,8 +88,9 @@ top_i_service_layer_service_layer_inst_0_partial.pdi
   For each site type, the table gives the X/Y range and the SLR within every clock region. Sites
   that lie in no clock region would get one line per type and SLR; on the xcv80 there are none,
   all 645,774 sites lie in a clock region. Generating the table takes about 2.5 minutes. The tool
-  looks for it at `--device`, then `$PDI_WHERE_DEVICE`, then `device/xcv80.tsv` next to the
-  executable.
+  looks for it at `--device`, then `$PDI_WHERE_DEVICE`, then next to the binary
+  (`device/xcv80.tsv`, as in the build tree), then in `share/versal-pdi-where/` of the install
+  tree.
 
 Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable` or `none`, 2 on error.
 

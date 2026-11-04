@@ -6,9 +6,9 @@
 //
 // pdi_where: say which reconfigurable pblock a partial PDI belongs to.
 //
-//   pdi_where --xdc impl.xdc [--xdc other.xdc ...] [--device TSV] [--rp NAME ...]
-//             [--json] FILE.pdi|FILE.vbin ...
-//   pdi_where --selftest
+//   pdi_where [-v] [--json] --xdc impl.xdc [--xdc other.xdc ...] [--device TSV] [--rp NAME ...]
+//             FILE.pdi|FILE.vbin ...
+//   pdi_where --selftest | --version
 //
 // Evidence, strongest first:
 //   1. SLRs. A partial writes configuration frames for every SLR its pblock has fabric in, and for
@@ -37,6 +37,9 @@
 //
 // Exit status: 0 every PDI is a "match"; 1 some PDI is probable, ambiguous or none; 2 error.
 #include <unistd.h>
+
+#include "config.hpp"
+#include "git.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +77,9 @@ std::string join(const std::set<int>& s) {
     return o.str();
 }
 
+// "row 3" or "rows 0,2,3"
+std::string rows_of(const std::set<int>& s) { return (s.size() == 1 ? "row " : "rows ") + join(s); }
+
 std::string slr_list(const std::array<bool, kSlrs>& a) {
     std::string o;
     for (int k = 0; k < kSlrs; ++k)
@@ -107,16 +113,16 @@ Verdict judge(const PdiInfo& p, const Candidate& c) {
         bool fabric = c.fp.slice_sites[k] > 0;
         if (u.configured() && !c.fp.slr[k]) {
             v.slr_ok = false;
-            v.why.push_back(std::string("writes ") + kSlrName[k] + ", which the pblock does not cover");
+            v.why.push_back(std::string(kSlrName[k]) + " written, not in pblock");
         }
         if (!u.configured() && fabric) {
             v.slr_ok = false;
-            v.why.push_back(std::string("pblock has fabric in ") + kSlrName[k] + ", which the PDI does not configure");
+            v.why.push_back(std::string(kSlrName[k]) + " in pblock, not written");
         }
         if (!u.configured() && c.fp.slr[k] && !fabric) {
             std::string t;
             for (const auto& s : c.fp.types[k]) t += (t.empty() ? "" : ",") + s;
-            v.why.push_back(std::string("note: pblock reaches ") + kSlrName[k] + " only through " + t);
+            v.why.push_back(std::string("note: ") + kSlrName[k] + " reached only via " + t + ", not written");
         }
         std::set<int> written = rows_written(u, g_dev->fabric_rows[k].size());
         if (u.configured() && !written.empty()) {
@@ -128,13 +134,12 @@ Verdict judge(const PdiInfo& p, const Candidate& c) {
                 if (!written.count(r)) missing.insert(r);
             if (!missing.empty()) {
                 v.rows_ok = false;
-                v.why.push_back(std::string("pblock has fabric in ") + kSlrName[k] + " CFU rows {" +
-                                join(missing) + "}, which the PDI does not write");
+                v.why.push_back(std::string(kSlrName[k]) + " " + rows_of(missing) + " in pblock, not written");
             }
             if (!extra.empty()) {
                 v.extra_rows += int(extra.size());
-                v.why.push_back(std::string("writes ") + kSlrName[k] + " CFU rows {" + join(extra) +
-                                "} outside the pblock's {" + join(c.fp.cfu_rows[k]) + "}");
+                v.why.push_back(std::string(kSlrName[k]) + " " + rows_of(extra) + " written outside pblock" +
+                                (c.fp.cfu_rows[k].empty() ? "" : " (pblock has " + join(c.fp.cfu_rows[k]) + ")"));
             }
         }
         if (u.configured()) pdi_tot += double(u.cfu_bytes);
@@ -205,47 +210,63 @@ Result classify(const PdiInfo& p, const std::vector<Candidate>& cs) {
     return r;
 }
 
-void print_text(const PdiInfo& p, const Result& r) {
-    std::printf("%s\n", p.name.c_str());
-    std::printf("  %llu bytes, id_code 0x%08x, image 0x%08x \"%s\", %s\n",
+std::string basename(const std::string& path) { return path.substr(path.find_last_of('/') + 1); }
+
+std::string verdict(const Result& r) {
+    if (r.status == "none") return "no match";
+    return r.status == "match" ? r.chosen->pb->name : r.chosen->pb->name + " (" + r.status + ")";
+}
+
+void print_short(const PdiInfo& p, const Result& r) {
+    std::printf("%s: %s\n", p.name.c_str(), verdict(r).c_str());
+    if (!r.hint.empty() && (!r.chosen || r.chosen->pb->name != r.hint))
+        std::fprintf(stderr, "pdi_where: warning: %s: member name points to %s\n", p.name.c_str(), r.hint.c_str());
+}
+
+void print_long(const PdiInfo& p, const Result& r) {
+    std::printf("%s: %s\n", p.name.c_str(), verdict(r).c_str());
+    std::printf("  %llu bytes, idcode 0x%08x, image 0x%08x (%s), %s\n\n",
                 static_cast<unsigned long long>(p.bytes), p.id_code, p.image_id, p.image_name.c_str(),
-                p.compressed() ? "compressed (rows from FAR-header scan)" : "uncompressed");
+                p.compressed() ? "compressed" : "uncompressed");
+    std::printf("  SLR  %10s  %4s  rows\n", "CFU bytes", "NPI");
     for (int k = 0; k < kSlrs; ++k) {
         const SlrUse& u = p.slr[k];
-        std::printf("  %s  %-10s CFU %12llu B  NPI writes %4d", kSlrName[k],
-                    u.configured() ? "configured" : "empty", static_cast<unsigned long long>(u.cfu_bytes),
-                    u.npi_writes);
-        if (u.configured() && u.decoded)
-            std::printf("  frames %llu, CFU rows {%s}", static_cast<unsigned long long>(u.frames),
-                        join(u.cfu_rows).c_str());
-        else if (u.configured()) {
-            std::printf("  CFU rows {%s} by FAR hits", join(rows_written(u, g_dev->fabric_rows[k].size())).c_str());
-            for (auto [r, n] : u.far_hits)
-                if (r < int(g_dev->fabric_rows[k].size()))
-                    std::printf(" %d:%llu", r, static_cast<unsigned long long>(n));
+        std::set<int> rows = rows_written(u, g_dev->fabric_rows[k].size());
+        std::printf("  %-3d  %10llu  %4d  %-7s", k, static_cast<unsigned long long>(u.cfu_bytes), u.npi_writes,
+                    u.configured() && !rows.empty() ? join(rows).c_str() : "-");
+        if (!u.configured())
+            std::printf("  not configured");
+        else if (u.decoded)
+            std::printf("  %llu frames", static_cast<unsigned long long>(u.frames));
+        else {
+            std::printf("  far hits");
+            for (auto [row, n] : u.far_hits)
+                if (row < int(g_dev->fabric_rows[k].size()))
+                    std::printf(" %d:%llu", row, static_cast<unsigned long long>(n));
         }
         std::printf("\n");
     }
+    int wn = 6, wx = 3;
     for (const auto& v : r.verdicts) {
-        bool ok = v.slr_ok && v.rows_ok;
-        std::printf("  %s %s (%s): covers %s", !ok ? "fail" : v.extra_rows ? "loose" : "PASS", v.c->pb->name.c_str(),
-                    v.c->pb->source.c_str(), slr_list(v.c->fp.slr).c_str());
-        std::printf(", area-share distance %.2f\n", v.share_dist);
-        for (const auto& w : v.why) std::printf("       %s\n", w.c_str());
+        wn = std::max(wn, int(v.c->pb->name.size()));
+        wx = std::max(wx, int(basename(v.c->pb->source).size()));
     }
-    if (r.status == "match")
-        std::printf("  => %s\n", r.chosen->pb->name.c_str());
-    else if (r.status == "probable")
-        std::printf("  => PROBABLY %s: several pblocks fit, all with rows written outside them; this one is closest\n",
-                    r.chosen->pb->name.c_str());
-    else if (r.status == "ambiguous")
-        std::printf("  => AMBIGUOUS: several pblocks fit; nearest by area share is %s (weak evidence)\n",
-                    r.chosen->pb->name.c_str());
-    else
-        std::printf("  => NO MATCH: no pblock is consistent with this PDI\n");
+    std::printf("\n  %-*s  %-*s  %-5s  %4s\n", wn, "pblock", wx, "xdc", "SLRs", "dist");
+    for (const auto& v : r.verdicts) {
+        std::string slrs;
+        for (int k = 0; k < kSlrs; ++k)
+            if (v.c->fp.slr[k]) slrs += (slrs.empty() ? "" : ",") + std::to_string(k);
+        std::string state = !(v.slr_ok && v.rows_ok) ? "rejected"
+                            : v.extra_rows == 0      ? "fits"
+                                                     : "fits, " + std::to_string(v.extra_rows) +
+                                                      (v.extra_rows == 1 ? " row" : " rows") + " outside";
+        std::printf("  %-*s  %-*s  %-5s  %4.2f  %s\n", wn, v.c->pb->name.c_str(), wx,
+                    basename(v.c->pb->source).c_str(), slrs.empty() ? "-" : slrs.c_str(), v.share_dist, state.c_str());
+        for (const auto& w : v.why) std::printf("    %s\n", w.c_str());
+    }
     if (!r.hint.empty())
-        std::printf("  file name says %s%s\n", r.hint.c_str(),
-                    r.chosen && r.chosen->pb->name == r.hint ? " (agrees)" : " (DISAGREES)");
+        std::printf("\n  member name points to %s%s\n", r.hint.c_str(),
+                    r.chosen && r.chosen->pb->name == r.hint ? "" : " (differs)");
 }
 
 void print_json(const PdiInfo& p, const Result& r, bool last) {
@@ -265,8 +286,8 @@ void print_json(const PdiInfo& p, const Result& r, bool last) {
         if (!u.far_hits.empty()) {
             std::printf(", \"far_hits\": {");
             bool first = true;
-            for (auto [r, n] : u.far_hits)
-                std::printf("%s\"%d\": %llu", first ? "" : ", ", r, static_cast<unsigned long long>(n)), first = false;
+            for (auto [row, n] : u.far_hits)
+                std::printf("%s\"%d\": %llu", first ? "" : ", ", row, static_cast<unsigned long long>(n)), first = false;
             std::printf("}");
         }
         std::printf("}");
@@ -295,16 +316,16 @@ std::vector<Candidate> candidates(const std::vector<std::string>& xdcs, const st
         if (!want) continue;
         Candidate c{&p, footprint(p, dev)};
         for (const auto& t : c.fp.unknown_types)
-            std::fprintf(stderr, "warning: %s: %s: site type %s is not in the device table; ignored\n",
+            std::fprintf(stderr, "pdi_where: warning: %s: %s: site type %s not in device table, ignored\n",
                          p.source.c_str(), p.name.c_str(), t.c_str());
         if (c.fp.has_remove)
-            std::fprintf(stderr, "warning: %s: %s: -remove ranges ignored (footprint may be too large)\n",
+            std::fprintf(stderr, "pdi_where: warning: %s: %s: -remove ranges ignored\n",
                          p.source.c_str(), p.name.c_str());
         cs.push_back(std::move(c));
     }
     if (cs.empty())
-        throw PdiError(rps.empty() ? "no reconfigurable pblock (SNAPPING_MODE set) in the XDC; name one with --rp"
-                                   : "none of the --rp pblocks is in the XDC");
+        throw PdiError(rps.empty() ? "no pblock with SNAPPING_MODE in the XDC (use --rp)"
+                                   : "--rp: no such pblock in the XDC");
     return cs;
 }
 
@@ -415,9 +436,9 @@ std::vector<uint8_t> synth_pdi(std::vector<uint8_t> c0, std::vector<uint8_t> c1,
 }
 
 int selftest() {
-    int fails = 0;
+    int fails = 0, checks = 0;
     auto check = [&](const char* what, bool ok) {
-        std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what);
+        std::printf("%s %d - %s\n", ok ? "ok" : "not ok", ++checks, what);
         fails += !ok;
     };
     // device: 3 SLRs, two fabric rows each (CR rows 1-2, 3-4, 5-6), 100 SLICE rows per CR row,
@@ -583,11 +604,13 @@ int selftest() {
         auto m = untar(t);
         check("tar: member name and data", m.size() == 1 && m[0].first == n && m[0].second.size() == 5);
     }
-    std::printf("%s (%d failure%s)\n", fails ? "SELFTEST FAILED" : "selftest passed", fails, fails == 1 ? "" : "s");
+    std::printf("1..%d\n", checks);
+    if (fails) std::printf("# %d of %d failed\n", fails, checks);
     return fails ? 1 : 0;
 }
 
-// --device, else $PDI_WHERE_DEVICE, else device/xcv80.tsv next to the executable.
+// --device, else $PDI_WHERE_DEVICE, else the first xcv80.tsv found: next to the executable (build
+// tree), in the source tree above it, in the install tree relative to it, at the configured prefix.
 std::string default_device() {
     if (const char* e = std::getenv("PDI_WHERE_DEVICE")) return e;
     char buf[4096];
@@ -597,14 +620,27 @@ std::string default_device() {
         std::string exe(buf, size_t(n));
         dir = exe.substr(0, exe.find_last_of('/'));
     }
-    return dir + "/device/xcv80.tsv";
+    const std::string tries[] = {dir + "/device/xcv80.tsv", dir + "/../device/xcv80.tsv",
+                                 dir + "/" PDI_WHERE_DATADIR_REL "/xcv80.tsv", PDI_WHERE_DATADIR "/xcv80.tsv"};
+    for (const auto& t : tries)
+        if (access(t.c_str(), R_OK) == 0) return t;
+    return tries[0];
 }
 
-int usage() {
-    std::fprintf(stderr,
-                 "usage: pdi_where --xdc FILE [--xdc FILE ...] [--device TSV] [--rp PBLOCK ...] [--json] PDI|VBIN ...\n"
-                 "       pdi_where --selftest\n");
-    return 2;
+const char kUsage[] =
+    "usage: pdi_where [-v] [--json] --xdc FILE [--xdc FILE ...] [--device TSV] [--rp PBLOCK ...] PDI|VBIN ...\n"
+    "       pdi_where --selftest\n"
+    "       pdi_where --version\n"
+    "\n"
+    "  --xdc FILE    pblock constraints; candidates are pblocks with SNAPPING_MODE set\n"
+    "  --rp PBLOCK   use these pblocks as candidates instead\n"
+    "  --device TSV  device table (default: device/xcv80.tsv next to the binary)\n"
+    "  -v            show SLRs, rows and every candidate\n"
+    "  --json        machine-readable output\n";
+
+int usage(bool ok = false) {
+    std::fputs(kUsage, ok ? stdout : stderr);
+    return ok ? 0 : 2;
 }
 
 }  // namespace
@@ -612,21 +648,26 @@ int usage() {
 int main(int argc, char** argv) {
     std::vector<std::string> xdcs, rps, inputs;
     std::string device = default_device();
-    bool json = false;
+    bool json = false, verbose = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--selftest") {
             try {
                 return selftest();
             } catch (const std::exception& e) {
-                std::printf("SELFTEST FAILED: exception: %s\n", e.what());
+                std::printf("Bail out! %s\n", e.what());
                 return 1;
             }
         }
+        if (a == "--version") {
+            std::printf("pdi_where %s%s%s\n", PDI_WHERE_VERSION, *PDI_WHERE_GIT ? " " : "", PDI_WHERE_GIT);
+            return 0;
+        }
         if (a == "--json") json = true;
+        else if (a == "-v" || a == "--verbose") verbose = true;
         else if ((a == "--xdc" || a == "--device" || a == "--rp") && i + 1 < argc)
             (a == "--xdc" ? xdcs.push_back(argv[++i]) : a == "--rp" ? rps.push_back(argv[++i]) : void(device = argv[++i]));
-        else if (a == "-h" || a == "--help") return usage();
+        else if (a == "-h" || a == "--help") return usage(true);
         else if (!a.empty() && a[0] == '-') return usage();
         else inputs.push_back(a);
     }
@@ -648,7 +689,9 @@ int main(int argc, char** argv) {
         if (json) std::printf("[\n");
         for (size_t i = 0; i < res.size(); ++i) {
             if (json) print_json(res[i].first, res[i].second, i + 1 == res.size());
-            else print_text(res[i].first, res[i].second);
+            else if (verbose) print_long(res[i].first, res[i].second);
+            else print_short(res[i].first, res[i].second);
+            if (verbose && !json && i + 1 < res.size()) std::putchar('\n');
             all = all && res[i].second.status == "match";
         }
         if (json) std::printf("]\n");

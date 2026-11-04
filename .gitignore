@@ -1,4 +1,4 @@
-pdi_where
+build/
 *.log
 *.jou
 .Xil/
