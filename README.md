@@ -181,13 +181,11 @@ printed as a cross-check and is never used to decide.
 - **Footprint estimate:** from XDC bounding boxes intersected with the device table. A site type
   missing from the table is warned about and ignored.
 - **NPI writes:** counted, but not mapped to NoC sites; Vivado exposes no NPI address on a site.
-- **Row granularity is the ceiling.** These partials reconfigure whole clock-region rows: a row the
-  pblock touches is written in full, every column, whatever the pblock's width in it. Measured on
-  uncompressed partials, a floorplan covering only the top of SLR1 writes that row's ~72k frames,
-  the same as one covering all of SLR1. The frame-address stream therefore carries no column
-  information, and two pblocks that share a row (such as the service shell's two pblocks in SLR1
-  row 2) cannot be separated by frame addresses. Finer-than-row placement would need to compare
-  frame *contents* against a reference, not the addresses, which this tool does not do.
+- **No column resolution.** The tool works per clock-region row, so two pblocks that share a row
+  and differ only by column are not told apart. The service shell's two pblocks both reach SLR1
+  row 2, split by X there. Uncompressed streams carry a FAR value per frame, which may encode the
+  column, but that is not established: in the uncompressed partials at hand, every shared row has
+  the same column coverage in both floorplans, so they cannot show it.
 
 ## License
 
