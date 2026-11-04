@@ -90,13 +90,16 @@ std::string slr_list(const std::array<bool, kSlrs>& a) {
 constexpr uint64_t kMinFarHits = 500;
 constexpr double kMinFarShare = 0.02;
 
-// CFU rows an SLR's stream writes: decoded rows, or the filtered FAR-header scan.
+// CFU rows an SLR's stream writes. Decoded chunks contribute their frame rows directly; chunks that
+// did not decode contribute the thresholded FAR-header scan. The two are unioned, so one
+// undecodable chunk cannot hide the rows of chunks that did decode in the same SLR.
 std::set<int> rows_written(const SlrUse& u, size_t fabric_rows) {
-    if (u.decoded) return u.cfu_rows;
+    std::set<int> out;
+    for (int r : u.cfu_rows)
+        if (r < int(fabric_rows)) out.insert(r);
     uint64_t top = 0;
     for (auto [r, n] : u.far_hits)
         if (r < int(fabric_rows)) top = std::max(top, n);
-    std::set<int> out;
     for (auto [r, n] : u.far_hits)
         if (r < int(fabric_rows) && n >= kMinFarHits && n >= kMinFarShare * top) out.insert(r);
     return out;
@@ -393,13 +396,16 @@ std::vector<uint8_t> section(const std::vector<uint8_t>& cmds) {
     s.insert(s.end(), cmds.begin(), cmds.end());
     return s;
 }
-// per SLR: CFU chunk payload (empty vector -> just the empty open/close chunk) and NPI writes
+// per SLR: CFU chunk payload (empty vector -> just the empty open/close chunk) and NPI writes.
+// extra[k], when non-empty, is forwarded as a second CFU keyhole in that SLR, so an SLR can carry
+// one decodable and one undecodable chunk at once.
 std::vector<uint8_t> synth_pdi(std::vector<uint8_t> c0, std::vector<uint8_t> c1, std::vector<uint8_t> c2,
-                               std::array<int, kSlrs> npi) {
+                               std::array<int, kSlrs> npi, std::array<std::vector<uint8_t>, kSlrs> extra = {}) {
     const std::vector<uint8_t>* cfu[kSlrs] = {&c0, &c1, &c2};
     auto body = [&](int k) {
         std::vector<uint8_t> c;
         keyhole(c, 0xF1F80000, cfu[k]->empty() ? cfu_frames({}) : *cfu[k]);
+        if (!extra[k].empty()) keyhole(c, 0xF1F80000, extra[k]);
         for (int i = 0; i < npi[k]; ++i) {
             std::vector<uint8_t> p;
             put(p, 0), put(p, 0xF6230100 + 0x10000 * i);
@@ -577,6 +583,19 @@ int selftest() {
               rows_written(q.slr[1], dev.fabric_rows[1].size()) == std::set<int>({1}));
         Result rq = classify(q, cs);
         check("scan: compressed user-shaped PDI -> pblock_user", rq.status == "match" && rq.chosen->pb->name == "pblock_user");
+    }
+    // 3e. mixed SLR: one decodable frame chunk (rows 0-1) and one undecodable chunk in the same SLR.
+    //     The decodable chunk's rows must survive; one opaque chunk must not blank the SLR.
+    {
+        std::array<std::vector<uint8_t>, kSlrs> extra;
+        extra[1] = cfu_opaque(4000);  // second CFU keyhole in SLR1, not the frame format
+        PdiInfo p = analyse("mixed.pdi", synth_pdi({}, rows01(), rows01(), {0, 1, 1}, extra));
+        check("mixed: SLR with an undecodable chunk is not marked fully decoded", !p.slr[1].decoded);
+        check("mixed: decoded rows survive the undecodable chunk",
+              rows_written(p.slr[1], dev.fabric_rows[1].size()) == std::set<int>({0, 1}));
+        Result r = classify(p, cs);
+        check("mixed: placement uses the decoded rows -> pblock_wide",
+              r.status == "match" && r.chosen->pb->name == "pblock_wide");
     }
     // 4. a partial that configures only SLR2: matches nothing (every candidate has fabric elsewhere)
     {
