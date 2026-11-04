@@ -20,7 +20,6 @@ Example, on a SLASH service-shell build:
 
 ```
 $ ./pdi_where --xdc tests/fixtures/slash-service.xdc top_i_service_layer_service_layer_inst_0_partial.pdi
-warning: tests/fixtures/slash-service.xdc: pblock_service_layer: site type ILKNF is not in the device table; ignored
 top_i_service_layer_service_layer_inst_0_partial.pdi
   13738624 bytes, id_code 0x14d2f093, image 0x18700002 "CONFIG_MASTER", compressed (rows from FAR-header scan)
   SLR0  configured CFU      4694576 B  NPI writes   70  CFU rows {0,2,3} by FAR hits 0:7954 1:14 2:59078 3:64231
@@ -31,7 +30,7 @@ top_i_service_layer_service_layer_inst_0_partial.pdi
        writes SLR0 CFU rows {0,2,3} outside the pblock's {}
        writes SLR1 CFU rows {0,1} outside the pblock's {2}
        pblock has fabric in SLR2, which the PDI does not configure
-  loose pblock_service_layer (tests/fixtures/slash-service.xdc): covers SLR0+SLR1, area-share distance 0.03
+  loose pblock_service_layer (tests/fixtures/slash-service.xdc): covers SLR0+SLR1, area-share distance 0.01
        writes SLR0 CFU rows {0} outside the pblock's {2,3}
   => pblock_service_layer
   file name says pblock_service_layer (agrees)
@@ -56,17 +55,10 @@ top_i_service_layer_service_layer_inst_0_partial.pdi
   ```
 
   For each site type, the table gives the X/Y range and the SLR within every clock region. Sites
-  that lie in no clock region get one line per type and SLR. The tool looks for the table at
-  `--device`, then `$PDI_WHERE_DEVICE`, then `device/xcv80.tsv` next to the executable.
-
-  **The shipped `device/xcv80.tsv` is incomplete.** It is a snapshot of an interrupted run and
-  lacks:
-  - clock regions X9Y4 (in part) to X9Y9;
-  - every site that lies in no clock region, such as `ILKNF`, which is why the example above
-    warns about it.
-
-  Every result in this README was obtained with this snapshot. A complete table will replace it;
-  until then, regenerate it with the command above if you have Vivado.
+  that lie in no clock region would get one line per type and SLR; on the xcv80 there are none,
+  all 645,774 sites lie in a clock region. Generating the table takes about 2.5 minutes. The tool
+  looks for it at `--device`, then `$PDI_WHERE_DEVICE`, then `device/xcv80.tsv` next to the
+  executable.
 
 Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable` or `none`, 2 on error.
 

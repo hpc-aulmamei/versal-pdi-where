@@ -48,27 +48,31 @@ foreach cr [lsort [get_clock_regions]] {
         puts $fh "$t\t$slr\t$cr\t$row\t$x0\t$x1\t$y0\t$y1\t$n"
     }
 }
-# Sites outside every clock region (GT, XPIO, PMC-side blocks, ...): one line per site type and
-# SLR, with that type's bounding box in the SLR.
+# Sites outside every clock region (none on the xcv80): one line per site type and SLR, with that
+# type's bounding box in the SLR. Sweeping every site of every SLR is very slow in Vivado, so only
+# the sites missing from the clock-region pass are looked up, one by one.
 set orphans 0
-foreach slr [lsort [get_slrs]] {
-    set idx [get_property SLR_INDEX $slr]
+set all [get_sites -quiet]
+if {[llength $all] > [dict size $seen]} {
     set agg [dict create]
-    foreach s [get_sites -quiet -of_objects $slr] {
+    foreach s $all {
         if {[dict exists $seen $s]} continue
         set k [site_key $s]
         if {$k eq {}} continue
         lassign $k t x y
         incr orphans
-        if {[dict exists $agg $t]} {
-            lassign [dict get $agg $t] x0 x1 y0 y1 n
-            dict set agg $t [list [expr {min($x0,$x)}] [expr {max($x1,$x)}] \
-                                  [expr {min($y0,$y)}] [expr {max($y1,$y)}] [incr n]]
+        set idx [get_property SLR_INDEX [get_slrs -quiet -of_objects $s]]
+        set key [list $t $idx]
+        if {[dict exists $agg $key]} {
+            lassign [dict get $agg $key] x0 x1 y0 y1 n
+            dict set agg $key [list [expr {min($x0,$x)}] [expr {max($x1,$x)}] \
+                                    [expr {min($y0,$y)}] [expr {max($y1,$y)}] [incr n]]
         } else {
-            dict set agg $t [list $x $x $y $y 1]
+            dict set agg $key [list $x $x $y $y 1]
         }
     }
-    dict for {t v} $agg {
+    dict for {key v} $agg {
+        lassign $key t idx
         lassign $v x0 x1 y0 y1 n
         puts $fh "$t\t$idx\t-\t-\t$x0\t$x1\t$y0\t$y1\t$n"
     }
