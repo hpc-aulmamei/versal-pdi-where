@@ -182,10 +182,20 @@ printed as a cross-check and is never used to decide.
   missing from the table is warned about and ignored.
 - **NPI writes:** counted, but not mapped to NoC sites; Vivado exposes no NPI address on a site.
 - **No column resolution.** The tool works per clock-region row, so two pblocks that share a row
-  and differ only by column are not told apart. The service shell's two pblocks both reach SLR1
-  row 2, split by X there. Uncompressed streams carry a FAR value per frame, which may encode the
-  column, but that is not established: in the uncompressed partials at hand, every shared row has
-  the same column coverage in both floorplans, so they cannot show it.
+  and differ only by column are not told apart. Uncompressed streams do carry the column. This
+  was checked on uncompressed exports of both service-shell partials, mapped with Vivado's logic
+  location files (`write_device_image -logic_location_file`), in SLR1 row 2, which both pblocks
+  reach:
+  - FAR bits 8–19 number the frame columns left to right in X, and bits 20–22 give the block
+    type.
+  - Where only one pblock has sites in a column, only its partial writes that column (X0–83 and
+    X352–379 for the service layer, X164–243 for the user region).
+  - Where both have sites in a column at different heights (X84–163 and X244–351), both partials
+    write the same 36,467 frame addresses, with FAR bits 23 and up set to 1 in one and 2 in the
+    other.
+
+  Using this needs a per-part table from frame column to X, which the device table does not have
+  yet. Whether the FAR values survive compression has not been checked.
 
 ## License
 
