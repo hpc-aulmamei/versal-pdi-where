@@ -19,6 +19,7 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -101,12 +102,17 @@ uint64_t keyhole_dst(const std::vector<uint8_t>& b, const Cmd& c) {
 // word is a packet header (bits 31:24 opcode, 23:16 CFU row, 15:8 register). 0xA1 is a one-quad
 // register write (register 0x01 = FAR); 0x52 with register 0x04 (FDRI) is followed by a count of
 // data quads, always 25 here (one 100-word frame); other 0x52 quads stand alone.
+// The FAR value: bits 0-19 a frame index within the row that rises with X, bits 20-22 the block
+// type (0 = interconnect and logic, the block every column has), bits 23 and up 0, or 1 / 2 on
+// frames two pblocks share. In real partials every frame follows its own FAR write in its row.
 // Returns false, without touching `u`, if anything in it is not that format (compressed streams).
 bool decode_cfu(const uint8_t* p, uint64_t n, SlrUse& u) {
     if (n % 16) return false;
-    uint64_t words = n / 4, q = 0, frames = 0;
+    uint64_t words = n / 4, q = 0, frames = 0, unaddressed = 0;
     std::set<int> rows;
-    bool far_seen = false;
+    std::map<int, std::vector<uint32_t>> at;
+    bool far_seen = false, far_fresh = false;
+    uint32_t far = 0, far_row = 0;
     auto w = [&](uint64_t k) {
         uint32_t v;
         std::memcpy(&v, p + 4 * k, 4);
@@ -121,18 +127,30 @@ bool decode_cfu(const uint8_t* p, uint64_t n, SlrUse& u) {
             if (cnt * 4 != kFrameWords || !far_seen || q + 4 + 4ULL * cnt > words) return false;
             rows.insert(int(row));
             ++frames;
+            if (far_fresh && far_row == row) {
+                if (((far >> 20) & 7) == 0) at[int(row)].push_back(far & 0xFFFFF);
+            } else {
+                ++unaddressed;
+            }
+            far_fresh = false;
             q += 4 + 4ULL * cnt;
             continue;
         }
         if (op == 0xA1) {
-            if (reg == 0x01 && row != 0x1F) far_seen = true;
+            if (reg == 0x01 && row != 0x1F) {
+                if (q + 1 >= words) return false;
+                far_seen = far_fresh = true;
+                far = w(q + 1), far_row = row;
+            }
         } else if (op != 0x52) {
             return false;
         }
         q += 4;
     }
     u.frames += frames;
+    u.frames_unaddressed += unaddressed;
     u.cfu_rows.insert(rows.begin(), rows.end());
+    for (auto& [r, v] : at) u.frames_at[r].insert(u.frames_at[r].end(), v.begin(), v.end());
     return true;
 }
 
@@ -236,7 +254,14 @@ PdiInfo analyse(const std::string& name, const std::vector<uint8_t>& b) {
     visit(b, s, e, 0, info, slave_out, dec[0]);
     for (int k = 1; k < kSlrs; ++k)
         for (auto [cs, ce] : sections(slave[k])) visit(slave[k], cs, ce, k, info, nullptr, dec[k]);
-    for (int k = 0; k < kSlrs; ++k) info.slr[k].decoded = dec[k] && info.slr[k].cfu_chunks > 0;
+    for (int k = 0; k < kSlrs; ++k) {
+        SlrUse& u = info.slr[k];
+        u.decoded = dec[k] && u.cfu_chunks > 0;
+        for (auto& [r, v] : u.frames_at) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+    }
     return info;
 }
 

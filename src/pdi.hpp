@@ -33,6 +33,11 @@ struct SlrUse {
     bool decoded = false;        // every CFU chunk parsed as the uncompressed frame format
     uint64_t frames = 0;         // frames written (decoded streams only)
     std::set<int> cfu_rows;      // CFU rows written (decoded streams only)
+    // Decoded streams: per CFU row, the block-0 frame indices written (FAR bits 0-19, sorted,
+    // unique), which the frame table turns into SLICE columns; and frames that did not follow their
+    // own FAR write in their row, whose column is therefore unknown (none in real partials).
+    std::map<int, std::vector<uint32_t>> frames_at;
+    uint64_t frames_unaddressed = 0;
     // Compressed streams: the FAR packet header (0xA1 | row | 0x01 | check, little-endian) survives
     // compression intact but not quad-aligned; hits of that 4-byte pattern at any byte offset, per
     // row byte. Real rows get thousands of hits; see rows_written() in main.cpp for the filter.

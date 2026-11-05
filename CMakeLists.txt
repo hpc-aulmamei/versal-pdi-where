@@ -71,11 +71,15 @@ foreach(t pdi_where_core pdi_where)
     endif()
 endforeach()
 
-# The binary looks for device/xcv80.tsv next to itself first, so a build tree runs as is.
-configure_file(device/xcv80.tsv "${CMAKE_CURRENT_BINARY_DIR}/device/xcv80.tsv" COPYONLY)
+# The binary looks for device/xcv80.tsv next to itself first, so a build tree runs as is. The frame
+# table sits beside it under the same stem.
+foreach(table xcv80.tsv xcv80.frames.tsv)
+    configure_file(device/${table} "${CMAKE_CURRENT_BINARY_DIR}/device/${table}" COPYONLY)
+endforeach()
 
 install(TARGETS pdi_where RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES device/xcv80.tsv scripts/gen_device_table.tcl DESTINATION "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}")
+install(FILES device/xcv80.tsv device/xcv80.frames.tsv scripts/gen_device_table.tcl scripts/gen_frame_table.tcl
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}")
 install(FILES README.md LICENSE DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
 if(PDI_WHERE_TESTS)

@@ -106,6 +106,18 @@ int Device::cfu_row(int slr, int cr_row) const {
     return it == v.end() ? -1 : int(it - v.begin());
 }
 
+bool load_frames(Device& d, const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return false;
+    parse_frames(d, slurp(path));
+    return true;
+}
+
+const std::vector<FrameCol>* Device::columns(int slr, int row) const {
+    auto it = frame_cols[slr].find(row);
+    return it == frame_cols[slr].end() || it->second.empty() ? nullptr : &it->second;
+}
+
 Device parse_device(const std::string& text) {
     Device d;
     std::istringstream in(text);
@@ -144,6 +156,40 @@ Device parse_device(const std::string& text) {
 }
 
 Device load_device(const std::string& path) { return parse_device(slurp(path)); }
+
+std::string frames_path(const std::string& device_path) {
+    const std::string suf = ".tsv";
+    if (device_path.size() >= suf.size() && device_path.compare(device_path.size() - suf.size(), suf.size(), suf) == 0)
+        return device_path.substr(0, device_path.size() - suf.size()) + ".frames.tsv";
+    return device_path + ".frames.tsv";
+}
+
+void parse_frames(Device& d, const std::string& text) {
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("# pdi_where frame table: part ", 0) == 0) {
+            d.frames_part = line.substr(30, line.find(',') - 30);
+            continue;
+        }
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream f(line);
+        int slr, row;
+        FrameCol c;
+        if (!(f >> slr >> row >> c.x0 >> c.x1 >> c.frame) || slr < 0 || slr >= kSlrs || c.x0 > c.x1)
+            throw PdiError("frame table: bad line: " + line);
+        d.frame_cols[slr][row].push_back(c);
+    }
+    if (d.frames_part != d.part)
+        throw PdiError("frame table is for part " + d.frames_part + ", device table for " + d.part);
+    for (auto& rows : d.frame_cols)
+        for (auto& [row, v] : rows) {
+            std::sort(v.begin(), v.end(), [](const FrameCol& a, const FrameCol& b) { return a.x0 < b.x0; });
+            for (size_t i = 1; i < v.size(); ++i)
+                if (v[i].x0 <= v[i - 1].x1 || v[i].frame <= v[i - 1].frame)
+                    throw PdiError("frame table: row " + std::to_string(row) + ": columns overlap or frames fall as X rises");
+        }
+}
 
 std::vector<Pblock> parse_xdc(const std::string& text, const std::string& source) {
     // join backslash continuations, drop comments
@@ -235,7 +281,11 @@ Footprint footprint(const Pblock& pb, const Device& dev) {
             if (c.cr_row >= 0) {
                 int row = dev.cfu_row(c.slr, c.cr_row);
                 if (row >= 0) fp.cfu_rows[c.slr].insert(row);
-                if (row >= 0 && c.type == "SLICE") fp.fabric_rows[c.slr].insert(row);
+                if (row >= 0 && c.type == "SLICE") {
+                    fp.fabric_rows[c.slr].insert(row);
+                    int x0 = cr ? c.xmin : std::max(r.x0, c.xmin), x1 = cr ? c.xmax : std::min(r.x1, c.xmax);
+                    for (int x = x0; x <= x1; ++x) fp.slice_cols[c.slr][row].insert(x);
+                }
             }
             if (c.type == "SLICE") fp.slice_sites[c.slr] += frac * c.sites;
         }

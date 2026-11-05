@@ -91,6 +91,20 @@ top_i_service_layer_service_layer_inst_0_partial.pdi: pblock_service_layer
   looks for it at `--device`, then `$PDI_WHERE_DEVICE`, then next to the binary
   (`device/xcv80.tsv`, as in the build tree), then in `share/versal-pdi-where/` of the install
   tree.
+- **The frame table** `device/xcv80.frames.tsv`, optional, read from beside the device table.
+  For every SLICE column (the two sites of one CLE tile) of every CFU row, it gives the frame that
+  holds that column's flip-flop bits: 1,786 columns on the xcv80. `scripts/gen_frame_table.tcl`
+  writes it in about 8 minutes, again with no build. Run it from a scratch directory, since
+  Vivado leaves a few files in the current one:
+
+  ```
+  vivado -mode batch -source scripts/gen_frame_table.tcl -tclargs xcv80-lsva4737-2MHP-e-S device/xcv80.frames.tsv
+  ```
+
+  The script places one flip-flop on AFF and one on HFF2 of a SLICE at every X in every clock
+  region, in a bare netlist, and reads the frame addresses back from Vivado's logic location file.
+  The netlist has no CIPS, so the CIPS-2 DRC is lowered to a warning, and its device image must
+  never be loaded. Without the table, the tool works as before, per SLR and row only.
 
 Exit status: 0 if every PDI is a `match`, 1 if any is `ambiguous`, `probable`, `unverified` or
 `none`, 2 on error.
@@ -127,21 +141,42 @@ carries it.
    outside the pblock only counts against the candidate, for two reasons. A full-device SLASH
    compute partial writes SLR0 CFU row 0, which no site of its pblock reaches. The service layer's
    partial writes part of SLR0 row 0 through GT-side hard blocks that belong to no clock region.
-3. **Tie-break.** The fewest rows written outside the pblock wins, then the per-SLR share of CFU
-   bytes compared with the pblock's per-SLR share of SLICEs.
+3. **Columns (uncompressed streams with a frame table; hard one way, soft the other).** Every
+   frame follows its own FAR write. FAR bits 0–19 are a frame index within the row that rises with
+   X, bits 20–22 the block type, and bits 23 and up are 0, or 1 or 2 on frames two pblocks share.
+   A partial writes every frame of each column it configures. So a SLICE column counts as written
+   when its flip-flop frame is, and that needs no rule for where a column's frames end. In every
+   row where both the stream writes and the pblock has SLICEs:
+   - Every column of the pblock's SLICE ranges must be written: this rejects a candidate.
+   - A written column outside those ranges only counts against the candidate. Snapping widens a
+     pblock by a few columns, and a pblock reaches more columns through its non-SLICE sites
+     (`IRI_QUAD`, hard blocks) than its SLICE ranges show.
+
+   Frames between two columns' flip-flop frames (interconnect, and hard-block columns such as
+   BRAM, DSP or NoC) are not attributed. Compressed streams don't keep FAR values: in the
+   service-shell partials, taking the word after each surviving FAR header as a column gives more
+   false columns than true ones.
+4. **Tie-break.** The fewest rows written outside the pblock wins, then the fewest columns, then
+   the per-SLR share of CFU bytes compared with the pblock's per-SLR share of SLICEs.
 
 Status:
 - **match:** exactly one pblock passes the hard tests, or several do and exactly one has no row
-  outside it.
-- **ambiguous:** several pass with no row outside them; the nearest by area share is named.
+  outside it. Or several pass with no row outside them, columns were checked for all of them, and
+  exactly one has the fewest columns outside. That holds for the true pblock: a pblock that is a
+  column subset of it passes too, but with every column it lacks counted outside, and a superset
+  fails on the columns that weren't written.
+- **ambiguous:** several pass with no row outside them, and columns don't separate them; the
+  nearest by area share is named.
 - **probable:** several pass, but all with rows outside them; the closest is named.
 - **unverified:** a pblock was chosen, but the PDI carries frame-capable content the SLR and row
   accounting does not follow, so the placement cannot be trusted. The best-fit pblock is still
   named, as a guess; the reasons are printed under `unverified:` (to stderr in the default output,
-  in the `caveats` array in JSON). Two things trigger it, neither seen in any real Vivado partial:
-  a keyhole write to a destination other than the CFU stream or an SLR forward, and CFU content in
-  an SLR that is neither a clean empty chunk nor a configured SLR (0 < it < the configured
-  threshold).
+  in the `caveats` array in JSON). Three things trigger it, none seen in any real Vivado partial:
+  - a keyhole write to a destination other than the CFU stream or an SLR forward;
+  - CFU content in an SLR that is neither a clean empty chunk nor a configured SLR (0 < it < the
+    configured threshold);
+  - with a frame table, an uncompressed frame that doesn't follow its own FAR write in its row,
+    so its column is unknown (all 594,744 frames of the two service-shell exports follow one).
 - **none:** nothing passes.
 
 What the verdict rests on, and what it does not: the tool follows the keyhole-CFU configuration
@@ -168,6 +203,18 @@ printed as a cross-check and is never used to decide.
   - 8 are `probable`, with the right pblock named. All come from the full-device floorplan,
     where a second floorplan, the first one's SLR0 top row plus SLR1 and SLR2, also passes.
 
+With the frame table, the result is the same for all 72, and the true pblock passes every column
+check in the three uncompressed partials. Two more uncompressed partials were exported from a
+service-shell build's routed checkpoint, one per pblock; their compressed twins are byte-identical
+to the partials the build shipped. Both are a `match`. In SLR1 row 2, which both pblocks reach,
+the columns alone reject the other pblock:
+- The service layer's partial leaves the user region's X164–243 unwritten.
+- The user region's partial leaves the service layer's X0–83 and X352–363 unwritten.
+
+In the build's logic location files, every flip-flop bit of the 68,515 SLICE sites that have one
+lies in the table's frame for its column, for all 16 flip-flops of a site, not only the two the
+probe uses. The generator's probe confirms the CFU-row mapping on all ten fabric rows.
+
 `tests/slash.manifest` re-runs the SLASH part against the bundled XDC fixtures.
 
 ## Limits
@@ -176,26 +223,15 @@ printed as a cross-check and is never used to decide.
   from AMD documentation. Another Vivado version or part may differ; the selftest pins the
   format the tool assumes. Other parts need their own device table, and the tool expects three
   SLRs.
-- **Unchecked:** the CFU-row mapping was checked on SLR1 rows 5–7, SLR2 rows 8–10 and SLR0 row 4.
-  SLR0 rows 1–3 were never isolated in a floorplan of their own.
 - **Footprint estimate:** from XDC bounding boxes intersected with the device table. A site type
   missing from the table is warned about and ignored.
 - **NPI writes:** counted, but not mapped to NoC sites; Vivado exposes no NPI address on a site.
-- **No column resolution.** The tool works per clock-region row, so two pblocks that share a row
-  and differ only by column are not told apart. Uncompressed streams do carry the column. This
-  was checked on uncompressed exports of both service-shell partials, mapped with Vivado's logic
-  location files (`write_device_image -logic_location_file`), in SLR1 row 2, which both pblocks
-  reach:
-  - FAR bits 8–19 number the frame columns left to right in X, and bits 20–22 give the block
-    type.
-  - Where only one pblock has sites in a column, only its partial writes that column (X0–83 and
-    X352–379 for the service layer, X164–243 for the user region).
-  - Where both have sites in a column at different heights (X84–163 and X244–351), both partials
-    write the same 36,467 frame addresses, with FAR bits 23 and up set to 1 in one and 2 in the
-    other.
-
-  Using this needs a per-part table from frame column to X, which the device table does not have
-  yet. Whether the FAR values survive compression has not been checked.
+- **Columns in uncompressed streams only.** Compressed partials, which are the ones loaded on the
+  card, are still told apart per SLR and row only. So two pblocks that share their rows and differ
+  only by column are `ambiguous` when compressed.
+- **Columns from SLICE ranges only.** A pblock's columns come from its SLICE and `CLOCKREGION`
+  ranges. Frames of hard-block columns, and columns reached only through non-SLICE sites, are not
+  checked, so that part of a partial's footprint goes unverified.
 
 ## License
 

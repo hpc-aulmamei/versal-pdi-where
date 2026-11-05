@@ -27,15 +27,26 @@
 //      against it but does not reject it: a full-device SLASH compute partial writes SLR0 CFU row 0,
 //      which no site of its pblock reaches, and the service layer's partial writes a GT-side part
 //      of SLR0 row 0 through hard blocks that lie in no clock region.
-//   3. Tie-break when several pblocks pass: fewest rows written outside the pblock, then the share
-//      of CFU bytes per SLR against the share of the pblock's SLICE sites per SLR (frames scale
-//      with area; compressed bytes only roughly).
-// Status: "match" when exactly one pblock passes the hard tests (SLRs, rows the pblock must have
-// written), or when several do and exactly one of them has no row written outside it; "ambiguous"
-// when several pass with no row outside (nearest by area share is named); "probable" when several
-// pass but every one has rows outside it (the closest is named); "none" when nothing passes.
+//   3. SLICE columns, for uncompressed streams when a frame table is present: every frame follows
+//      its own FAR write, whose bits 0-19 index the frame within the row, rising with X. A column
+//      counts as written when the frame holding its flip-flop bits is. In each row the stream
+//      writes and the pblock has SLICEs in, every column of the pblock's SLICE ranges must be
+//      written (hard); written columns outside them count against it (snapping, and non-SLICE
+//      sites, take a pblock a few columns past its SLICE ranges). Compressed streams keep no
+//      usable FAR values.
+//   4. Tie-break when several pblocks pass: fewest rows written outside the pblock, then fewest
+//      columns, then the share of CFU bytes per SLR against the share of the pblock's SLICE sites
+//      per SLR (frames scale with area; compressed bytes only roughly).
+// Status: "match" when exactly one pblock passes the hard tests (SLRs, rows and columns the pblock
+// must have written), or when several do and exactly one of them has no row written outside it, or
+// when several have no row outside, columns were checked for all of them and exactly one has the
+// fewest columns outside; "ambiguous" when several pass with no row outside and columns do not
+// separate them (nearest by area share is named); "probable" when several pass but every one has
+// rows outside it (the closest is named); "unverified" when a pblock was chosen but the PDI carries
+// content the accounting does not follow; "none" when nothing passes.
 //
-// Exit status: 0 every PDI is a "match"; 1 some PDI is probable, ambiguous or none; 2 error.
+// Exit status: 0 every PDI is a "match"; 1 some PDI is probable, ambiguous, unverified or none;
+// 2 error.
 #include <unistd.h>
 
 #include "config.hpp"
@@ -65,7 +76,10 @@ struct Candidate {
 struct Verdict {
     const Candidate* c = nullptr;
     bool slr_ok = true, rows_ok = true, rows_checked = false;
-    int extra_rows = 0;            // rows written outside the pblock (uncompressed only)
+    int extra_rows = 0;            // rows written outside the pblock
+    bool cols_ok = true, cols_checked = false;
+    int extra_cols = 0;            // SLICE columns written outside the pblock, in its own rows
+                                   // (uncompressed streams with a frame table only)
     std::vector<std::string> why;  // reasons it fails, or notes
     double share_dist = 0;         // L1 distance of per-SLR shares, 0..2
 };
@@ -107,6 +121,49 @@ std::set<int> rows_written(const SlrUse& u, size_t fabric_rows) {
 
 const Device* g_dev = nullptr;  // set in main / selftest; rows_written needs the SLR's row count
 
+// "X84-163,X244-351": runs of adjacent table columns, by index into the row's columns
+std::string col_ranges(const std::vector<FrameCol>& cols, const std::vector<size_t>& idx) {
+    std::string o;
+    for (size_t i = 0; i < idx.size();) {
+        size_t j = i;
+        while (j + 1 < idx.size() && idx[j + 1] == idx[j] + 1) ++j;
+        int a = cols[idx[i]].x0, b = cols[idx[j]].x1;
+        o += (o.empty() ? "X" : ",X") + std::to_string(a) + (a == b ? "" : "-" + std::to_string(b));
+        i = j + 1;
+    }
+    return o;
+}
+
+// Columns of one row the pblock reaches and the stream writes. A column is written when its
+// flip-flop frame is: a partial writes every frame of the columns it configures.
+void judge_columns(const SlrUse& u, const Candidate& c, int k, int r, Verdict& v) {
+    const std::vector<FrameCol>* cols = g_dev->columns(k, r);
+    auto pit = c.fp.slice_cols[k].find(r);
+    if (!cols || pit == c.fp.slice_cols[k].end()) return;
+    v.cols_checked = true;
+    static const std::vector<uint32_t> none;
+    auto fit = u.frames_at.find(r);
+    const std::vector<uint32_t>& fr = fit == u.frames_at.end() ? none : fit->second;
+    std::vector<size_t> missing, extra;
+    for (size_t i = 0; i < cols->size(); ++i) {
+        const FrameCol& col = (*cols)[i];
+        auto x = pit->second.lower_bound(col.x0);
+        bool in = x != pit->second.end() && *x <= col.x1;
+        bool written = std::binary_search(fr.begin(), fr.end(), col.frame);
+        if (in && !written) missing.push_back(i);
+        if (!in && written) extra.push_back(i);
+    }
+    std::string where = std::string(kSlrName[k]) + " row " + std::to_string(r) + " ";
+    if (!missing.empty()) {
+        v.cols_ok = false;
+        v.why.push_back(where + col_ranges(*cols, missing) + " in pblock, not written");
+    }
+    if (!extra.empty()) {
+        v.extra_cols += int(extra.size());
+        v.why.push_back(where + col_ranges(*cols, extra) + " written outside the pblock's SLICE ranges");
+    }
+}
+
 Verdict judge(const PdiInfo& p, const Candidate& c) {
     Verdict v;
     v.c = &c;
@@ -144,6 +201,8 @@ Verdict judge(const PdiInfo& p, const Candidate& c) {
                 v.why.push_back(std::string(kSlrName[k]) + " " + rows_of(extra) + " written outside pblock" +
                                 (c.fp.cfu_rows[k].empty() ? "" : " (pblock has " + join(c.fp.cfu_rows[k]) + ")"));
             }
+            if (u.decoded)
+                for (int r : written) judge_columns(u, c, k, r, v);
         }
         if (u.configured()) pdi_tot += double(u.cfu_bytes);
         pb_tot += c.fp.slice_sites[k];
@@ -204,6 +263,9 @@ std::vector<std::string> trust_caveats(const PdiInfo& p) {
         if (u.ambiguous_cfu())
             out.push_back(std::string(kSlrName[k]) + ": " + std::to_string(u.cfu_bytes) +
                           " B of CFU content, neither an empty SLR nor a configured one");
+        if (u.frames_unaddressed > 0 && !g_dev->frame_cols[k].empty())
+            out.push_back(std::string(kSlrName[k]) + ": " + std::to_string(u.frames_unaddressed) +
+                          " frame(s) without their own FAR write, so their columns are unknown");
     }
     return out;
 }
@@ -213,19 +275,27 @@ Result classify(const PdiInfo& p, const std::vector<Candidate>& cs) {
     for (const auto& c : cs) r.verdicts.push_back(judge(p, c));
     std::vector<const Verdict*> hard, exact;
     for (const auto& v : r.verdicts)
-        if (v.slr_ok && v.rows_ok) {
+        if (v.slr_ok && v.rows_ok && v.cols_ok) {
             hard.push_back(&v);
             if (v.extra_rows == 0) exact.push_back(&v);
         }
     auto order = [](const Verdict* a, const Verdict* b) {
-        return a->extra_rows != b->extra_rows ? a->extra_rows < b->extra_rows : a->share_dist < b->share_dist;
+        if (a->extra_rows != b->extra_rows) return a->extra_rows < b->extra_rows;
+        if (a->extra_cols != b->extra_cols) return a->extra_cols < b->extra_cols;
+        return a->share_dist < b->share_dist;
     };
     std::sort(hard.begin(), hard.end(), order);
     std::sort(exact.begin(), exact.end(), order);
+    // Several pblocks fit row for row: when columns were checked for all of them, the one with the
+    // fewest columns outside it wins outright. A pblock that is a column subset of the true one fits
+    // too, but with every column it lacks counted outside; a superset fails on its unwritten columns.
+    bool cols_decide = exact.size() > 1 &&
+                       std::all_of(exact.begin(), exact.end(), [](const Verdict* v) { return v->cols_checked; }) &&
+                       exact[0]->extra_cols < exact[1]->extra_cols;
     r.hint = name_hint(p, cs);
     if (hard.empty()) {
         r.status = "none";
-    } else if (hard.size() == 1 || exact.size() == 1) {
+    } else if (hard.size() == 1 || exact.size() == 1 || cols_decide) {
         r.status = "match";
         r.chosen = hard[0]->c;
     } else if (exact.size() > 1) {
@@ -290,10 +360,14 @@ void print_long(const PdiInfo& p, const Result& r) {
         std::string slrs;
         for (int k = 0; k < kSlrs; ++k)
             if (v.c->fp.slr[k]) slrs += (slrs.empty() ? "" : ",") + std::to_string(k);
-        std::string state = !(v.slr_ok && v.rows_ok) ? "rejected"
-                            : v.extra_rows == 0      ? "fits"
-                                                     : "fits, " + std::to_string(v.extra_rows) +
-                                                      (v.extra_rows == 1 ? " row" : " rows") + " outside";
+        std::string outside;
+        if (v.extra_rows) outside = std::to_string(v.extra_rows) + (v.extra_rows == 1 ? " row" : " rows");
+        if (v.extra_cols)
+            outside += (outside.empty() ? "" : ", ") + std::to_string(v.extra_cols) +
+                       (v.extra_cols == 1 ? " column" : " columns");
+        std::string state = !(v.slr_ok && v.rows_ok && v.cols_ok) ? "rejected"
+                            : outside.empty()                     ? "fits"
+                                                                  : "fits, " + outside + " outside";
         std::printf("  %-*s  %-*s  %-5s  %4.2f  %s\n", wn, v.c->pb->name.c_str(), wx,
                     basename(v.c->pb->source).c_str(), slrs.empty() ? "-" : slrs.c_str(), v.share_dist, state.c_str());
         for (const auto& w : v.why) std::printf("    %s\n", w.c_str());
@@ -333,9 +407,11 @@ void print_json(const PdiInfo& p, const Result& r, bool last) {
     std::printf("],\n   \"candidates\": [");
     for (size_t i = 0; i < r.verdicts.size(); ++i) {
         const auto& v = r.verdicts[i];
-        std::printf("%s{\"pblock\": %s, \"xdc\": %s, \"pass\": %s, \"share_distance\": %.4f, \"rows_outside\": %d, \"reasons\": [",
+        std::printf("%s{\"pblock\": %s, \"xdc\": %s, \"pass\": %s, \"share_distance\": %.4f, \"rows_outside\": %d, "
+                    "\"columns_checked\": %s, \"columns_outside\": %d, \"reasons\": [",
                     i ? ", " : "", json_str(v.c->pb->name).c_str(), json_str(v.c->pb->source).c_str(),
-                    v.slr_ok && v.rows_ok ? "true" : "false", v.share_dist, v.extra_rows);
+                    v.slr_ok && v.rows_ok && v.cols_ok ? "true" : "false", v.share_dist, v.extra_rows,
+                    v.cols_checked ? "true" : "false", v.extra_cols);
         for (size_t j = 0; j < v.why.size(); ++j) std::printf("%s%s", j ? ", " : "", json_str(v.why[j]).c_str());
         std::printf("]}");
     }
@@ -649,6 +725,72 @@ int selftest() {
         check("verify: keyhole off the accounted paths -> unverified, best guess kept",
               r.status == "unverified" && r.chosen && r.chosen->pb->name == "pblock_wide" && !r.caveats.empty());
     }
+    // 3g. columns: a frame table for the synthetic device (one column per two X, flip-flop frame 4i+1)
+    //     and three pblocks that share SLR1 row 1, split by X. Block-1 frames pad the CFU payload
+    //     past the configured threshold without touching any column.
+    {
+        Device dev2 = dev;
+        std::string ft = "# pdi_where frame table: part xtest, Vivado 0\n";
+        for (int k = 0; k < kSlrs; ++k)
+            for (int row = 0; row < 2; ++row)
+                for (int i = 0; i < 50; ++i)
+                    ft += std::to_string(k) + "\t" + std::to_string(row) + "\t" + std::to_string(2 * i) + "\t" +
+                          std::to_string(2 * i + 1) + "\t" + std::to_string(4 * i + 1) + "\n";
+        parse_frames(dev2, ft);
+        check("frames: table read", dev2.columns(1, 1) && dev2.columns(1, 1)->size() == 50);
+        check("frames: path beside the device table", frames_path("d/xcv80.tsv") == "d/xcv80.frames.tsv");
+        try {
+            Device d3 = dev;
+            parse_frames(d3, "# pdi_where frame table: part other, Vivado 0\n0\t0\t0\t1\t1\n");
+            check("frames: table for another part is an error", false);
+        } catch (const PdiError&) {
+            check("frames: table for another part is an error", true);
+        }
+        g_dev = &dev2;
+        const char* xdc2 =
+            "create_pblock pblock_l\n"
+            "resize_pblock pblock_l -add {SLICE_X0Y300:SLICE_X49Y399}\n"
+            "set_property SNAPPING_MODE ON [get_pblocks pblock_l]\n"
+            "create_pblock pblock_r\n"
+            "resize_pblock pblock_r -add {SLICE_X50Y300:SLICE_X99Y399}\n"
+            "set_property SNAPPING_MODE ON [get_pblocks pblock_r]\n"
+            "create_pblock pblock_all\n"
+            "resize_pblock pblock_all -add {SLICE_X0Y300:SLICE_X99Y399}\n"
+            "set_property SNAPPING_MODE ON [get_pblocks pblock_all]\n";
+        std::vector<Pblock> st2 = parse_xdc(xdc2, "cols.xdc");
+        std::vector<Candidate> c2;
+        for (const auto& pb : st2) c2.push_back({&pb, footprint(pb, dev2)});
+        check("footprint: SLICE columns per row", c2[0].fp.slice_cols[1].at(1).size() == 50 &&
+                                                  *c2[1].fp.slice_cols[1].at(1).begin() == 50);
+        auto padded = [&](int n) {  // frames 0..n-1 in block 0 of row 1, then 200 block-1 frames
+            std::vector<std::pair<int, int>> f;
+            for (int i = 0; i < n; ++i) f.push_back({1, i});
+            for (int i = 0; i < 200; ++i) f.push_back({1, 1 << 20 | i});
+            return cfu_frames(f);
+        };
+        PdiInfo left = analyse("left.pdi", synth_pdi({}, padded(100), {}, {0, 1, 0}));
+        check("pdi: block-0 frame indices kept per row", left.slr[1].frames_at.at(1).size() == 100);
+        Result rl = classify(left, c2);
+        check("columns: left half written -> pblock_l; unwritten columns reject the others",
+              rl.status == "match" && rl.chosen->pb->name == "pblock_l" && !rl.verdicts[2].cols_ok &&
+              !rl.verdicts[1].cols_ok);
+        PdiInfo all = analyse("all.pdi", synth_pdi({}, padded(200), {}, {0, 1, 0}));
+        Result ra = classify(all, c2);
+        check("columns: column subsets lose on columns outside -> match pblock_all",
+              ra.status == "match" && ra.chosen->pb->name == "pblock_all" && ra.verdicts[0].extra_cols == 25);
+        g_dev = &dev;
+        std::vector<Candidate> c1;
+        for (const auto& pb : st2) c1.push_back({&pb, footprint(pb, dev)});
+        check("columns: without a frame table the same partial is ambiguous", classify(all, c1).status == "ambiguous");
+        g_dev = &dev2;
+        auto nf = padded(200);
+        put_at(nf, 32 + 448 * 7, 0x52000000);  // frame 7's FAR write becomes a no-op quad
+        PdiInfo q = analyse("nofar.pdi", synth_pdi({}, nf, {}, {0, 1, 0}));
+        check("pdi: frame without its own FAR write counted", q.slr[1].frames_unaddressed == 1);
+        Result rq = classify(q, c2);
+        check("verify: frame without a FAR write -> unverified", rq.status == "unverified" && !rq.caveats.empty());
+        g_dev = &dev;
+    }
     // 4. a partial that configures only SLR2: matches nothing (every candidate has fabric elsewhere)
     {
         PdiInfo p = analyse("odd.pdi", synth_pdi({}, {}, cfu_opaque(100000), {0, 0, 1}));
@@ -705,7 +847,8 @@ const char kUsage[] =
     "\n"
     "  --xdc FILE    pblock constraints; candidates are pblocks with SNAPPING_MODE set\n"
     "  --rp PBLOCK   use these pblocks as candidates instead\n"
-    "  --device TSV  device table (default: device/xcv80.tsv next to the binary)\n"
+    "  --device TSV  device table (default: device/xcv80.tsv next to the binary); the frame\n"
+    "                table beside it (xcv80.frames.tsv) is read when present\n"
     "  -v            show SLRs, rows and every candidate\n"
     "  --json        machine-readable output\n";
 
@@ -745,6 +888,7 @@ int main(int argc, char** argv) {
     if (xdcs.empty() || inputs.empty()) return usage();
     try {
         Device dev = load_device(device);
+        load_frames(dev, frames_path(device));
         g_dev = &dev;
         std::vector<Pblock> store;
         store.reserve(64);
